@@ -532,9 +532,9 @@ def check_server_info(st, s):
                         f'Now: {uploads_text(new["uploads"])}')
     if old['version'] != new['version'] and '?' not in new['version']:
         send_to_discord(f'🔄 **{name}** updated: v{old["version"]} → v{new["version"]}')
-    if old.get('day') and new['day'] is not None and new['day'] < old['day'] - 5:
-        send_to_discord(f'💥 **{name}** in-game day counter reset (Day {old["day"]} → Day {new["day"]}). '
-                        'This usually means the server was **wiped**.')
+    if old.get('day') and new['day'] is not None and new['day'] < old['day']:
+        send_to_discord(f'🔙 **{name}** in-game day went backwards (Day {old["day"]} → Day {new["day"]}). '
+                        'The server loaded an older save: likely a **rollback** (or a wipe if it dropped a lot).')
 
 
 def format_info(st):
