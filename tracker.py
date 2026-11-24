@@ -1,4 +1,9 @@
 import os, re, time, json, urllib.request, urllib.error
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+# Daily summary is posted when the day rolls over in this time zone
+TZ = ZoneInfo(os.environ.get('TRACKER_TZ', 'America/Chicago'))
 
 # Secrets (set in GitHub, never in this file)
 WEBHOOK_URL = os.environ.get('DISCORD_WEBHOOK', '').strip()
@@ -103,7 +108,54 @@ def get_channel_id():
 HELP = ('**ARK tracker commands**\n'
         '`!add 1234` start tracking server 1234\n'
         '`!remove 1234` stop tracking it\n'
-        '`!list` show tracked servers')
+        '`!list` show tracked servers\n'
+        '`!today` population stats so far today')
+
+
+# ---------- daily summary ----------
+
+def today_str():
+    return datetime.now(TZ).strftime('%Y-%m-%d')
+
+
+def record_sample(state, num, name, cur):
+    d = state.setdefault('daily', {'date': today_str(), 'servers': {}})
+    s = d['servers'].setdefault(num, {'name': name, 'peak': cur, 'peak_at': '', 'low': cur, 'low_at': '',
+                                      'sum': 0, 'samples': 0, 'joins': 0, 'leaves': 0})
+    now = datetime.now(TZ).strftime('%I:%M %p').lstrip('0')
+    s['name'] = name
+    if cur >= s['peak'] or not s['peak_at']:
+        s['peak'], s['peak_at'] = cur, now
+    if cur <= s['low'] or not s['low_at']:
+        s['low'], s['low_at'] = cur, now
+    s['sum'] += cur
+    s['samples'] += 1
+
+
+def record_change(state, num, delta):
+    s = state.get('daily', {}).get('servers', {}).get(num)
+    if s:
+        s['joins' if delta > 0 else 'leaves'] += abs(delta)
+
+
+def format_summary(d, title):
+    if not d or not d.get('servers'):
+        return f'{title}\nNo data yet.'
+    lines = [title]
+    for s in d['servers'].values():
+        avg = s['sum'] / s['samples'] if s['samples'] else 0
+        lines.append(f'**{s["name"]}**\n'
+                     f'  Peak **{s["peak"]}** at {s["peak_at"]} · Low {s["low"]} at {s["low_at"]} · Avg {avg:.1f}\n'
+                     f'  Joins {s["joins"]} · Leaves {s["leaves"]}')
+    return '\n'.join(lines)
+
+
+def maybe_post_daily(state):
+    d = state.get('daily')
+    if d and d['date'] != today_str():
+        day = datetime.strptime(d['date'], '%Y-%m-%d').strftime('%A, %b %d').replace(' 0', ' ')
+        send_to_discord(format_summary(d, f'📅 **Daily population summary: {day}**'))
+        state['daily'] = {'date': today_str(), 'servers': {}}
 
 
 def handle_command(state, text):
@@ -137,6 +189,9 @@ def handle_command(state, text):
             lines = [f'• **{s["name"]}**: {s["last"] if s["last"] is not None else "?"} online'
                      for s in servers.values()]
             send_to_discord('**Tracked servers**\n' + '\n'.join(lines))
+        return True
+    if cmd in ('!today', '!summary', '!stats'):
+        send_to_discord(format_summary(state.get('daily'), '📊 **Today so far**'))
         return True
     if cmd == '!help':
         send_to_discord(HELP)
@@ -185,6 +240,7 @@ def check_servers(state):
         print(f'{stamp} [list] {type(e).__name__}: {e}')
         return
 
+    maybe_post_daily(state)
     for num, st in state['servers'].items():
         s = find_server(servers, num)
         if s is None:
@@ -201,6 +257,9 @@ def check_servers(state):
         mx = s.get('MaxPlayers', '?')
         last = st['last']
         print(f'{stamp} {st["name"]}: {cur}/{mx}')
+        record_sample(state, num, st['name'], cur)
+        if last is not None and not st['down'] and cur != last:
+            record_change(state, num, cur - last)
 
         if last is None or st['down']:
             send_to_discord(f'🟢 **Tracking {st["name"]}**\nCurrent Players: {cur} / {mx}')
