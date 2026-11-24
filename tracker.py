@@ -1,7 +1,7 @@
 import os, re, time, json, urllib.request
 
 # Webhook comes from the DISCORD_WEBHOOK secret (never put it in this file)
-WEBHOOK_URL = os.environ.get('DISCORD_WEBHOOK', '')
+WEBHOOK_URL = os.environ.get('DISCORD_WEBHOOK', '').strip()
 
 # Official server numbers to watch (the number at the end of the server name)
 SERVER_NUMBERS = ['9652', '9349', '9086']

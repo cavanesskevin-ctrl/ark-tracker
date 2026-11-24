@@ -26,7 +26,7 @@ jobs:
       - name: Run tracker
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: python tracker.py
+        run: python -u tracker.py
 
       # Save player counts so the next run picks up where this one left off.
       # The commit also keeps GitHub from pausing the schedule after 60 idle days.
