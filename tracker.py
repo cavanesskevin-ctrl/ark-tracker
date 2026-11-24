@@ -33,7 +33,7 @@ def send_to_discord(msg):
         print(f'[webhook] not set, would send: {msg}')
         return
     try:
-        http_json(WEBHOOK_URL, 'POST', {'content': msg}, timeout=10)
+        http_json(WEBHOOK_URL, 'POST', {'content': msg}, headers={'User-Agent': DISCORD_UA}, timeout=10)
     except Exception as e:
         print(f'[webhook] error: {e}')
 
@@ -74,14 +74,27 @@ def save_state(state):
 
 # ---------- Discord commands (!add / !remove / !list) ----------
 
+DISCORD_UA = 'DiscordBot (https://github.com/cavanesskevin-ctrl/ark-tracker, 1.0)'
+
+
 def bot_get(path):
-    return http_json(DISCORD_API + path, headers={'Authorization': f'Bot {BOT_TOKEN}'})
+    return http_json(DISCORD_API + path, headers={'Authorization': f'Bot {BOT_TOKEN}',
+                                                 'User-Agent': DISCORD_UA})
 
 
 def get_channel_id():
     # the channel the webhook posts to is the channel we read commands from
     try:
-        return http_json(WEBHOOK_URL)['channel_id']
+        cid = http_json(WEBHOOK_URL, headers={'User-Agent': DISCORD_UA})['channel_id']
+        me = bot_get('/users/@me')
+        print(f'[commands] bot {me.get("username")} reading channel {cid}')
+        bot_get(f'/channels/{cid}')  # fails here if the bot can't see the channel
+        return cid
+    except urllib.error.HTTPError as e:
+        print(f'[commands] could not use channel: HTTP {e.code} {e.read()[:300]!r}')
+        send_to_discord(f'⚠️ Commands are off: the bot can\'t access this channel (HTTP {e.code}). '
+                        'Make sure the ARK Tracker bot is in the server and can view this channel.')
+        return None
     except Exception as e:
         print(f'[commands] could not look up channel: {e}')
         return None

@@ -4,6 +4,10 @@ on:
   schedule:
     - cron: '*/30 * * * *'   # every 30 min; if a run is already going, the next one waits in line
   workflow_dispatch:          # lets you start it by hand from the Actions tab
+    inputs:
+      run_seconds:
+        description: 'How long to run (seconds). Leave blank for the normal ~5.5h.'
+        required: false
 
 concurrency:
   group: ark-tracker
@@ -27,6 +31,7 @@ jobs:
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          RUN_SECONDS: ${{ inputs.run_seconds || '19800' }}
         run: python -u tracker.py
 
       # Save player counts so the next run picks up where this one left off.
