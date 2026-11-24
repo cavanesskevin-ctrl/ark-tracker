@@ -23,22 +23,22 @@
       "9652": {
         "name": "EU-PVP-SmallTribes-LostColony9652",
         "peak": 2,
-        "peak_at": "12:04 AM",
+        "peak_at": "12:06 AM",
         "low": 2,
-        "low_at": "12:04 AM",
-        "sum": 8,
-        "samples": 4,
+        "low_at": "12:06 AM",
+        "sum": 12,
+        "samples": 6,
         "joins": 0,
         "leaves": 0
       },
       "9349": {
         "name": "EU-PVP-SmallTribes-Aberration9349",
         "peak": 1,
-        "peak_at": "12:04 AM",
+        "peak_at": "12:06 AM",
         "low": 1,
-        "low_at": "12:04 AM",
-        "sum": 4,
-        "samples": 4,
+        "low_at": "12:06 AM",
+        "sum": 6,
+        "samples": 6,
         "joins": 0,
         "leaves": 0
       },
@@ -47,22 +47,24 @@
         "peak": 5,
         "peak_at": "12:02 AM",
         "low": 4,
-        "low_at": "12:04 AM",
-        "sum": 18,
-        "samples": 4,
+        "low_at": "12:06 AM",
+        "sum": 26,
+        "samples": 6,
         "joins": 0,
         "leaves": 1
       }
     }
   },
-  "empty": {},
   "history": {
     "9652": {
       "2026-11-24": [
         [
-          3,
+          5,
           0,
-          6
+          10,
+          0,
+          2,
+          0
         ],
         [
           0,
@@ -184,9 +186,12 @@
     "9349": {
       "2026-11-24": [
         [
-          3,
+          5,
           0,
-          3
+          5,
+          2,
+          0,
+          0
         ],
         [
           0,
@@ -308,9 +313,12 @@
     "9086": {
       "2026-11-24": [
         [
-          3,
+          5,
           0,
-          13
+          21,
+          0,
+          0,
+          0
         ],
         [
           0,
@@ -428,6 +436,16 @@
           0
         ]
       ]
+    }
+  },
+  "stretch": {
+    "9652": {
+      "count": 2,
+      "since": "2026-11-24T00:05:27.894615-06:00"
+    },
+    "9349": {
+      "count": 1,
+      "since": "2026-11-24T00:05:27.896435-06:00"
     }
   }
 }
