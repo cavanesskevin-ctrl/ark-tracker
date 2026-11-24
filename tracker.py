@@ -113,6 +113,7 @@ HELP = ('**ARK tracker commands**\n'
         '`!add 1234` start tracking server 1234\n'
         '`!remove 1234` stop tracking it\n'
         '`!list` show tracked servers\n'
+        '`!info` (or `!info 1234`) map, in-game day, game version, and whether character/item/dino uploads are allowed\n'
         '`!today` population stats so far today\n'
         '`!empty` when each server sat at 0 players today + hours it is usually empty\n'
         '`!at 1234 1` when server 1234 had exactly 1 player today, how long, and hours that usually happens (works for 0-3)\n'
@@ -367,9 +368,20 @@ def handle_command(state, text):
         if not servers:
             send_to_discord('Not tracking any servers. Add one with `!add 1234`.')
         else:
-            lines = [f'• **{s["name"]}**: {s["last"] if s["last"] is not None else "?"} online'
-                     for s in servers.values()]
+            lines = []
+            for s in servers.values():
+                up = s.get('info', {}).get('uploads')
+                lines.append(f'• **{s["name"]}**: {s["last"] if s["last"] is not None else "?"} online'
+                             + (f' · uploads: {"".join("✅" if v else "❌" for v in up.values())} (chars/items/dinos)'
+                                if up else ''))
             send_to_discord('**Tracked servers**\n' + '\n'.join(lines))
+        return True
+    if cmd in ('!info', '!server'):
+        nums = [arg] if arg else list(servers)
+        if arg and arg not in servers:
+            send_to_discord(f'Not tracking `{arg}`. Use `!list` to see what is tracked.')
+        else:
+            send_to_discord('\n'.join(format_info(servers[n]) for n in nums) or 'Not tracking any servers.')
         return True
     if cmd in ('!today', '!summary', '!stats'):
         send_to_discord(format_summary(state.get('daily'), '📊 **Today so far**', state, live=True))
@@ -482,6 +494,57 @@ def check_servers(state):
             send_to_discord(f'👋 **{st["name"]}** Player Left. Online: {cur} / {mx} (-{last - cur})')
         st['last'] = cur
         st['down'] = False
+        check_server_info(st, s)
+
+
+# ---------- uploads / version / day counter ----------
+
+UPLOAD_KEYS = [('AllowDownloadChars', 'Characters'), ('AllowDownloadItems', 'Items'), ('AllowDownloadDinos', 'Dinos')]
+
+
+def server_info(s):
+    def num(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+    return {'uploads': {label: bool(num(s.get(k))) for k, label in UPLOAD_KEYS},
+            'version': f'{s.get("BuildId", "?")}.{s.get("MinorBuildId", "?")}',
+            'day': num(s.get('DayTime')),
+            'map': str(s.get('MapName', '')).replace('_WP', '')}
+
+
+def uploads_text(up):
+    return ' · '.join(f'{k} {"✅" if v else "❌"}' for k, v in up.items())
+
+
+def check_server_info(st, s):
+    """Alert when uploads, game version or the day counter change. Saves the latest info on the server entry."""
+    new, old = server_info(s), st.get('info')
+    st['info'] = new
+    if not old:
+        return
+    name = st['name']
+    changed = [k for k in new['uploads'] if old['uploads'].get(k) != new['uploads'][k]]
+    if changed:
+        parts = [f'{k} {"ON ✅" if new["uploads"][k] else "OFF ❌"}' for k in changed]
+        send_to_discord(f'📦 **{name}** uploads changed: {", ".join(parts)}\n'
+                        f'Now: {uploads_text(new["uploads"])}')
+    if old['version'] != new['version'] and '?' not in new['version']:
+        send_to_discord(f'🔄 **{name}** updated: v{old["version"]} → v{new["version"]}')
+    if old.get('day') and new['day'] is not None and new['day'] < old['day'] - 5:
+        send_to_discord(f'💥 **{name}** in-game day counter reset (Day {old["day"]} → Day {new["day"]}). '
+                        'This usually means the server was **wiped**.')
+
+
+def format_info(st):
+    i = st.get('info')
+    if not i:
+        return f'**{st["name"]}**: no info yet (server not seen since tracking started)'
+    return (f'**{st["name"]}** ({i["map"]})\n'
+            f'  Players: {st["last"] if st["last"] is not None else "?"} · Day {i["day"] if i["day"] is not None else "?"} '
+            f'· v{i["version"]}{" · ⚠️ offline" if st.get("down") else ""}\n'
+            f'  Uploads: {uploads_text(i["uploads"])}')
 
 
 # ---------- main loop ----------
