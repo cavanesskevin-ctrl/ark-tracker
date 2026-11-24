@@ -69,6 +69,10 @@ def load_state():
     if 'servers' not in saved:  # old format: {num: {...}}
         old = {k: v for k, v in saved.items() if k.isdigit()}
         saved = {'servers': old or {n: new_entry(n) for n in DEFAULT_SERVERS}, 'last_msg_id': None}
+    if 'empty' in saved:  # older 0-only tracking -> general low-count stretches
+        st = saved.setdefault('stretch', {})
+        for num, since in saved.pop('empty').items():
+            st.setdefault(num, {'count': 0, 'since': since})
     return saved
 
 
@@ -111,11 +115,13 @@ HELP = ('**ARK tracker commands**\n'
         '`!list` show tracked servers\n'
         '`!today` population stats so far today\n'
         '`!empty` when each server sat at 0 players today + hours it is usually empty\n'
-        '`!empty 1234` same, for one server\n'
-        '`!hours 1234` average players and % of time empty for every hour of the day')
+        '`!at 1234 1` when server 1234 had exactly 1 player today, how long, and hours that usually happens (works for 0-3)\n'
+        '`!low 1234` time spent at 0, 1, 2 and 3 players today\n'
+        '`!hours 1234` average players and % of time at 0 / 1 player for every hour of the day')
 
+LOW_MAX = 3              # stretches are tracked for player counts 0..LOW_MAX
 HISTORY_DAYS = 14        # how many days of hourly data to keep
-USUALLY_EMPTY_PCT = 0.8  # an hour counts as "usually empty" if it was at 0 this much of the time
+USUALLY_PCT = 0.6        # an hour counts as "usually at N" if it was at N this much of the time
 
 
 # ---------- daily summary ----------
@@ -141,14 +147,18 @@ def fmt_dur(secs):
     return f'{h}h {m}m' if h else f'{m}m'
 
 
-def close_empty(state, num, end_dt):
-    """End an open 'server at 0' stretch and log it in today's stats."""
-    since = state.setdefault('empty', {}).pop(num, None)
-    if not since:
+def players_word(n):
+    return f'{n} player' if n == 1 else f'{n} players'
+
+
+def close_stretch(state, num, end_dt):
+    """End the open 'server sat at N players' stretch and log it in today's stats."""
+    st = state.setdefault('stretch', {}).pop(num, None)
+    if not st:
         return
     s = state.get('daily', {}).get('servers', {}).get(num)
     if s is not None:
-        s.setdefault('empty_periods', []).append([since, end_dt.isoformat()])
+        s.setdefault('stretches', []).append([st['count'], st['since'], end_dt.isoformat()])
 
 
 def record_sample(state, num, name, cur):
@@ -164,58 +174,73 @@ def record_sample(state, num, name, cur):
     s['sum'] += cur
     s['samples'] += 1
 
-    # stretches at 0 players
-    empty = state.setdefault('empty', {})
-    if cur == 0 and num not in empty:
-        empty[num] = now.isoformat()
-    elif cur > 0:
-        close_empty(state, num, now)
+    # stretches at a low player count (0..LOW_MAX)
+    stretch = state.setdefault('stretch', {})
+    if num in stretch and stretch[num]['count'] != cur:
+        close_stretch(state, num, now)
+    if cur <= LOW_MAX and num not in stretch:
+        stretch[num] = {'count': cur, 'since': now.isoformat()}
 
-    # hourly history: [samples, samples at 0, total players]
+    # hourly history: [samples, samples at 0, total players, samples at 1, at 2, at 3]
     hist = state.setdefault('history', {}).setdefault(num, {})
-    day = hist.setdefault(today_str(), [[0, 0, 0] for _ in range(24)])
+    day = hist.setdefault(today_str(), [[0] * (3 + LOW_MAX) for _ in range(24)])
     slot = day[now.hour]
+    slot.extend([0] * (3 + LOW_MAX - len(slot)))  # older entries only had 3 fields
     slot[0] += 1
-    slot[1] += cur == 0
     slot[2] += cur
+    if cur == 0:
+        slot[1] += 1
+    elif cur <= LOW_MAX:
+        slot[2 + cur] += 1
 
 
-def empty_periods_today(state, num):
-    """Completed stretches today plus the one still going (if any), as (start, end, ongoing)."""
-    s = state.get('daily', {}).get('servers', {}).get(num, {})
-    out = [(datetime.fromisoformat(a), datetime.fromisoformat(b), False) for a, b in s.get('empty_periods', [])]
-    since = state.get('empty', {}).get(num)
-    if since:
-        out.append((datetime.fromisoformat(since), now_tz(), True))
-    return out
+def periods_today(state, num, count, daily=None, live=True):
+    """Stretches at exactly `count` players today, as (start, end, ongoing)."""
+    s = (daily or state.get('daily', {})).get('servers', {}).get(num, {})
+    out = [(datetime.fromisoformat(a), datetime.fromisoformat(b), False)
+           for c, a, b in s.get('stretches', []) if c == count]
+    if count == 0:  # from the older 0-only format
+        out += [(datetime.fromisoformat(a), datetime.fromisoformat(b), False)
+                for a, b in s.get('empty_periods', [])]
+    st = state.get('stretch', {}).get(num)
+    if live and st and st['count'] == count:
+        out.append((datetime.fromisoformat(st['since']), now_tz(), True))
+    return sorted(out)
+
+
+def total_secs(periods):
+    return sum((b - a).total_seconds() for a, b, _ in periods)
 
 
 def format_periods(periods, limit=6):
     parts = [f'{fmt_t(a)}–{"now" if live else fmt_t(b)} ({fmt_dur((b - a).total_seconds())})'
              for a, b, live in periods]
     if len(parts) > limit:
-        parts = parts[:limit] + [f'+{len(parts) - limit} more']
+        # show the longest ones
+        keep = sorted(range(len(periods)), key=lambda i: -(periods[i][1] - periods[i][0]).total_seconds())[:limit]
+        parts = [parts[i] for i in sorted(keep)] + [f'+{len(parts) - limit} shorter']
     return ', '.join(parts)
 
 
 def hourly_stats(state, num):
-    """Per hour of day across kept history: (avg players, fraction of time at 0, samples, days)."""
+    """Per hour of day across kept history: dict with avg players and fraction of time at 0..LOW_MAX."""
     days = state.get('history', {}).get(num, {})
     out = []
     for h in range(24):
-        n = sum(d[h][0] for d in days.values())
-        z = sum(d[h][1] for d in days.values())
-        tot = sum(d[h][2] for d in days.values())
-        out.append((tot / n if n else None, z / n if n else None, n))
+        slots = [d[h] + [0] * (3 + LOW_MAX - len(d[h])) for d in days.values()]
+        n = sum(x[0] for x in slots)
+        at = [sum(x[1] for x in slots)] + [sum(x[2 + k] for x in slots) for k in range(1, LOW_MAX + 1)]
+        out.append({'n': n, 'avg': sum(x[2] for x in slots) / n if n else None,
+                    'at': [a / n if n else None for a in at]})
     return out, len(days)
 
 
-def usually_empty_ranges(stats):
-    """Merge hours that are usually at 0 into ranges like '3 AM–6 AM (92%)'."""
+def usually_ranges(stats, count):
+    """Merge hours usually at `count` players into ranges like '3 AM–6 AM (92%)'."""
     ranges, start, pcts = [], None, []
     for h in range(25):
-        pct = stats[h][1] if h < 24 else None
-        if pct is not None and pct >= USUALLY_EMPTY_PCT:
+        pct = stats[h]['at'][count] if h < 24 else None
+        if pct is not None and pct >= USUALLY_PCT:
             if start is None:
                 start, pcts = h, []
             pcts.append(pct)
@@ -225,23 +250,41 @@ def usually_empty_ranges(stats):
     return ranges
 
 
-def format_empty(state, num):
+def format_at(state, num, count):
     name = state['servers'].get(num, {}).get('name', num)
-    periods = empty_periods_today(state, num)
-    total = sum((b - a).total_seconds() for a, b, _ in periods)
+    periods = periods_today(state, num, count)
     lines = [f'**{name}**']
     if periods:
-        lines.append(f'  At 0 today: **{fmt_dur(total)}** total. {format_periods(periods)}')
+        longest = max(periods, key=lambda p: p[1] - p[0])
+        lines.append(f'  At {players_word(count)} today: **{fmt_dur(total_secs(periods))}** total, '
+                     f'{len(periods)} time{"s" if len(periods) != 1 else ""}, longest '
+                     f'{fmt_dur((longest[1] - longest[0]).total_seconds())}')
+        lines.append(f'  {format_periods(periods)}')
     else:
-        lines.append('  Not at 0 at any point today.')
+        lines.append(f'  Never at {players_word(count)} today.')
     stats, ndays = hourly_stats(state, num)
-    ranges = usually_empty_ranges(stats)
+    ranges = usually_ranges(stats, count)
+    label = 'Usually empty' if count == 0 else f'Usually at {players_word(count)}'
     if ndays < 2:
-        lines.append(f'  Usually empty: still learning ({ndays} day of data so far).')
+        lines.append(f'  {label}: still learning ({ndays} day of data so far).')
     elif ranges:
-        lines.append(f'  Usually empty (last {ndays} days): {", ".join(ranges)}')
+        lines.append(f'  {label} (last {ndays} days): {", ".join(ranges)}')
     else:
-        lines.append(f'  Usually empty (last {ndays} days): no hour is reliably at 0.')
+        lines.append(f'  {label} (last {ndays} days): no hour where that reliably happens.')
+    return '\n'.join(lines)
+
+
+def format_low(state, num):
+    name = state['servers'].get(num, {}).get('name', num)
+    lines = [f'**{name}**: time at low player counts today']
+    for c in range(LOW_MAX + 1):
+        p = periods_today(state, num, c)
+        if p:
+            longest = max(p, key=lambda x: x[1] - x[0])
+            lines.append(f'  {players_word(c)}: **{fmt_dur(total_secs(p))}** ({len(p)}x, longest '
+                         f'{fmt_dur((longest[1] - longest[0]).total_seconds())})')
+        else:
+            lines.append(f'  {players_word(c)}: none')
     return '\n'.join(lines)
 
 
@@ -249,20 +292,15 @@ def format_hours(state, num):
     name = state['servers'].get(num, {}).get('name', num)
     stats, ndays = hourly_stats(state, num)
     rows = []
-    for h, (avg, pct, n) in enumerate(stats):
-        if n == 0:
-            rows.append(f'{fmt_hour(h):>5}    -   no data yet')
+    for h, st in enumerate(stats):
+        if st['n'] == 0:
+            rows.append(f'{fmt_hour(h):>5}    -    -    -   no data yet')
         else:
-            bar = '█' * round(pct * 10) + '░' * (10 - round(pct * 10))
-            rows.append(f'{fmt_hour(h):>5} {avg:5.1f}  {bar} {pct:4.0%}')
+            z, one = st['at'][0], st['at'][1]
+            bar = '█' * round((z + one) * 10) + '░' * (10 - round((z + one) * 10))
+            rows.append(f'{fmt_hour(h):>5} {st["avg"]:5.1f} {z:4.0%} {one:4.0%} {bar}')
     return (f'**{name}** by hour ({ndays} day{"s" if ndays != 1 else ""} of data, Central time)\n'
-            '```\n Hour   Avg  Time at 0 players\n' + '\n'.join(rows) + '\n```')
-
-
-def record_change(state, num, delta):
-    s = state.get('daily', {}).get('servers', {}).get(num)
-    if s:
-        s['joins' if delta > 0 else 'leaves'] += abs(delta)
+            '```\n Hour   Avg   @0   @1  time at 0-1 players\n' + '\n'.join(rows) + '\n```')
 
 
 def format_summary(d, title, state=None, live=False):
@@ -274,29 +312,27 @@ def format_summary(d, title, state=None, live=False):
         lines.append(f'**{s["name"]}**\n'
                      f'  Peak **{s["peak"]}** at {s["peak_at"]} · Low {s["low"]} at {s["low_at"]} · Avg {avg:.1f}\n'
                      f'  Joins {s["joins"]} · Leaves {s["leaves"]}')
-        periods = [(datetime.fromisoformat(a), datetime.fromisoformat(b), False)
-                   for a, b in s.get('empty_periods', [])]
-        if live and state is not None and state.get('empty', {}).get(num):
-            periods.append((datetime.fromisoformat(state['empty'][num]), now_tz(), True))
-        if periods:
-            total = sum((b - a).total_seconds() for a, b, _ in periods)
-            lines.append(f'  At 0 players: **{fmt_dur(total)}**. {format_periods(periods, limit=4)}')
+        st = state or {}
+        for c in (0, 1):
+            p = periods_today(st, num, c, daily=d, live=live)
+            if p:
+                lines.append(f'  At {players_word(c)}: **{fmt_dur(total_secs(p))}**. {format_periods(p, limit=3)}')
     return '\n'.join(lines)
 
 
 def maybe_post_daily(state):
     d = state.get('daily')
     if d and d['date'] != today_str():
-        # split any 0-player stretch at midnight so each day gets its own part
+        # split any open low-count stretch at midnight so each day gets its own part
         midnight = now_tz().replace(hour=0, minute=0, second=0, microsecond=0)
-        still_empty = list(state.get('empty', {}))
-        for num in still_empty:
-            close_empty(state, num, midnight)
+        open_stretches = {n: st['count'] for n, st in state.get('stretch', {}).items()}
+        for num in open_stretches:
+            close_stretch(state, num, midnight)
         day = datetime.strptime(d['date'], '%Y-%m-%d').strftime('%A, %b %d').replace(' 0', ' ')
-        send_to_discord(format_summary(d, f'📅 **Daily population summary: {day}**'))
+        send_to_discord(format_summary(d, f'📅 **Daily population summary: {day}**', state))
         state['daily'] = {'date': today_str(), 'servers': {}}
-        for num in still_empty:
-            state['empty'][num] = midnight.isoformat()
+        for num, c in open_stretches.items():
+            state['stretch'][num] = {'count': c, 'since': midnight.isoformat()}
         # keep only the last HISTORY_DAYS days of hourly data
         for days in state.get('history', {}).values():
             for old in sorted(days)[:-HISTORY_DAYS]:
@@ -338,14 +374,30 @@ def handle_command(state, text):
     if cmd in ('!today', '!summary', '!stats'):
         send_to_discord(format_summary(state.get('daily'), '📊 **Today so far**', state, live=True))
         return True
-    if cmd in ('!empty', '!zero', '!dead'):
+    if cmd in ('!empty', '!zero', '!dead', '!at', '!one', '!solo'):
+        count = 1 if cmd in ('!one', '!solo') else 0
+        if cmd == '!at':
+            n = parts[2] if len(parts) > 2 else ''
+            if not n.isdigit() or int(n) > LOW_MAX:
+                send_to_discord(f'Usage: `!at 1234 1` (server number, then a player count from 0 to {LOW_MAX})')
+                return True
+            count = int(n)
         nums = [arg] if arg else list(servers)
         if arg and arg not in servers:
             send_to_discord(f'Not tracking `{arg}`. Use `!list` to see what is tracked.')
         elif not nums:
             send_to_discord('Not tracking any servers.')
         else:
-            send_to_discord('🕳️ **Time at 0 players**\n' + '\n'.join(format_empty(state, n) for n in nums))
+            icon = '🕳️' if count == 0 else '👤'
+            send_to_discord(f'{icon} **Time at {players_word(count)}**\n'
+                            + '\n'.join(format_at(state, n, count) for n in nums))
+        return True
+    if cmd == '!low':
+        nums = [arg] if arg else list(servers)
+        if arg and arg not in servers:
+            send_to_discord(f'Not tracking `{arg}`. Use `!list` to see what is tracked.')
+        else:
+            send_to_discord('\n'.join(format_low(state, n) for n in nums) or 'Not tracking any servers.')
         return True
     if cmd == '!hours':
         if arg not in servers:
@@ -405,7 +457,7 @@ def check_servers(state):
         s = find_server(servers, num)
         if s is None:
             print(f'{stamp} {num}: not in list')
-            close_empty(state, num, now_tz())  # offline isn't "empty", stop the stretch
+            close_stretch(state, num, now_tz())  # offline isn't "empty", stop the stretch
             if not st['down'] and st['last'] is not None:
                 send_to_discord(f'⚠️ **{st["name"]}** disappeared from the server list (offline?).')
             elif st['last'] is None and not st['down']:
