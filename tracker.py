@@ -33,12 +33,14 @@ def http_json(url, method='GET', body=None, headers=None, timeout=30):
         return json.loads(raw) if raw else None
 
 
-def send_to_discord(msg):
+def send_to_discord(msg, ping=False):
     if not WEBHOOK_URL:
         print(f'[webhook] not set, would send: {msg}')
         return
     try:
-        http_json(WEBHOOK_URL, 'POST', {'content': msg}, headers={'User-Agent': DISCORD_UA}, timeout=10)
+        # only generator alerts may ping roles; everything else never pings anyone
+        body = {'content': msg[:2000], 'allowed_mentions': {'parse': ['roles'] if ping else []}}
+        http_json(WEBHOOK_URL, 'POST', body, headers={'User-Agent': DISCORD_UA}, timeout=10)
     except Exception as e:
         print(f'[webhook] error: {e}')
 
@@ -118,7 +120,11 @@ HELP = ('**ARK tracker commands**\n'
         '`!empty` when each server sat at 0 players today + hours it is usually empty\n'
         '`!at 1234 1` when server 1234 had exactly 1 player today, how long, and hours that usually happens (works for 0-3)\n'
         '`!low 1234` time spent at 0, 1, 2 and 3 players today\n'
-        '`!hours 1234` average players and % of time at 0 / 1 player for every hour of the day')
+        '`!hours 1234` average players and % of time at 0 / 1 player for every hour of the day\n'
+        '`!find low island na` lowest-pop official servers matching your words (`high`, `empty`, map, region, pvp/pve, small)\n'
+        '`!addgen base1 500` track a TEK generator (add a 3rd number for hours per element, default 18)\n'
+        '`!gen base1 500` update after refilling · `!gens` list all · `!removegen base1`\n'
+        '`!genrole @Role` who to ping when low · `!genwarn 12` warn this many hours before empty')
 
 LOW_MAX = 3              # stretches are tracked for player counts 0..LOW_MAX
 HISTORY_DAYS = 14        # how many days of hourly data to keep
@@ -417,6 +423,12 @@ def handle_command(state, text):
         else:
             send_to_discord(format_hours(state, arg))
         return True
+    if cmd in ('!addgen', '!gen', '!refill', '!removegen', '!delgen', '!gens', '!genrole', '!genwarn'):
+        gen_command(state, cmd, parts)
+        return True
+    if cmd == '!find':
+        find_command(parts)
+        return True
     if cmd == '!help':
         send_to_discord(HELP)
         return True
@@ -460,6 +472,7 @@ def check_servers(state):
     stamp = time.strftime('%H:%M:%S')
     try:
         servers = fetch_list()
+        LAST_LIST['servers'], LAST_LIST['at'] = servers, time.time()
     except Exception as e:
         print(f'{stamp} [list] {type(e).__name__}: {e}')
         return
@@ -537,6 +550,167 @@ def check_server_info(st, s):
                         'The server loaded an older save: likely a **rollback** (or a wipe if it dropped a lot).')
 
 
+# ---------- TEK generator timers ----------
+
+GEN_HOURS_PER_ELEMENT = 18.0   # default burn rate at default range; set per generator if yours differs
+GEN_WARN_HOURS = 12            # default warning before a generator runs out
+
+
+def gen_remaining(g):
+    """Elements left right now (can be fractional) and seconds until empty."""
+    burned = (time.time() - g['set_at']) / 3600 / g['hpe']
+    left = max(0.0, g['elements'] - burned)
+    return left, left * g['hpe'] * 3600
+
+
+def fmt_left(secs):
+    if secs <= 0:
+        return 'EMPTY'
+    d, rem = divmod(int(secs), 86400)
+    h, m = divmod(rem // 60, 60)
+    return f'{d}d {h}h' if d else f'{h}h {m}m'
+
+
+def format_gens(state):
+    gens = state.get('gens', {})
+    if not gens:
+        return 'No generators yet. Add one with `!addgen base1 500`.'
+    cfg = state.get('gen_cfg', {})
+    lines = ['⚡ **TEK generators**']
+    for name, g in sorted(gens.items(), key=lambda kv: gen_remaining(kv[1])[1]):
+        left, secs = gen_remaining(g)
+        empty_at = datetime.fromtimestamp(time.time() + secs, TZ)
+        icon = '🔴' if secs <= 0 else '🟠' if secs < cfg.get('warn', GEN_WARN_HOURS) * 3600 else '🟢'
+        when = '' if secs <= 0 else f' · empty {empty_at.strftime("%a %b %d").replace(" 0", " ")} {fmt_t(empty_at)}'
+        status = 'EMPTY' if secs <= 0 else f'{fmt_left(secs)} left'
+        lines.append(f'{icon} **{name}**: ~{int(left)} element · {status}{when}'
+                     + (f' · {g["hpe"]:g}h/element' if g['hpe'] != GEN_HOURS_PER_ELEMENT else ''))
+    lines.append(f'Warning at {cfg.get("warn", GEN_WARN_HOURS)}h left'
+                 + (f', pinging {cfg["role"]}' if cfg.get('role') else ' (set a role with `!genrole @Role`)'))
+    return '\n'.join(lines)
+
+
+def check_gens(state):
+    cfg = state.get('gen_cfg', {})
+    warn = cfg.get('warn', GEN_WARN_HOURS) * 3600
+    ping = (cfg.get('role', '') + ' ') if cfg.get('role') else ''
+    for name, g in state.get('gens', {}).items():
+        left, secs = gen_remaining(g)
+        if secs <= 0 and not g.get('alerted_empty'):
+            send_to_discord(f'🔴 {ping}TEK generator **{name}** is OUT of element! Refill it, then `!gen {name} <count>`.',
+                            ping=True)
+            g['alerted_empty'] = g['alerted_low'] = True
+        elif 0 < secs < warn and not g.get('alerted_low'):
+            send_to_discord(f'🟠 {ping}TEK generator **{name}** is low: ~{int(left)} element, {fmt_left(secs)} left.',
+                            ping=True)
+            g['alerted_low'] = True
+
+
+def gen_command(state, cmd, parts):
+    gens = state.setdefault('gens', {})
+    cfg = state.setdefault('gen_cfg', {})
+    if cmd in ('!addgen', '!gen', '!refill'):
+        if len(parts) < 3 or not re.fullmatch(r'\d{1,5}', parts[2]):
+            send_to_discord('Usage: `!addgen base1 500` (name, then element count). '
+                            'Optional burn rate: `!addgen base1 500 6` = 1 element every 6h.')
+            return
+        name = parts[1][:30]
+        hpe = gens.get(name, {}).get('hpe', GEN_HOURS_PER_ELEMENT)
+        if len(parts) > 3:
+            try:
+                hpe = max(0.1, float(parts[3]))
+            except ValueError:
+                send_to_discord('Burn rate must be a number of hours per element, e.g. `6` or `18`.')
+                return
+        gens[name] = {'elements': int(parts[2]), 'set_at': time.time(), 'hpe': hpe}
+        left, secs = gen_remaining(gens[name])
+        send_to_discord(f'⚡ **{name}** set to {parts[2]} element: lasts about **{fmt_left(secs)}**.')
+    elif cmd in ('!removegen', '!delgen'):
+        name = parts[1] if len(parts) > 1 else ''
+        if gens.pop(name, None) is not None:
+            send_to_discord(f'🗑️ Removed generator **{name}**.')
+        else:
+            send_to_discord(f'No generator named `{name or "?"}`. See `!gens`.')
+    elif cmd == '!gens':
+        send_to_discord(format_gens(state))
+    elif cmd == '!genrole':
+        m = re.search(r'<@&\d+>', ' '.join(parts[1:]))
+        if m:
+            cfg['role'] = m.group(0)
+            send_to_discord(f'Generator alerts will ping {cfg["role"]}.', ping=False)
+        elif len(parts) > 1 and parts[1].lower() in ('off', 'none'):
+            cfg.pop('role', None)
+            send_to_discord('Generator alerts will not ping anyone.')
+        else:
+            send_to_discord('Usage: `!genrole @Role` (mention the role) or `!genrole off`.')
+    elif cmd == '!genwarn':
+        if len(parts) > 1 and parts[1].isdigit():
+            cfg['warn'] = int(parts[1])
+            for g in gens.values():
+                g['alerted_low'] = False
+            send_to_discord(f'Generators will warn at {cfg["warn"]}h left.')
+        else:
+            send_to_discord('Usage: `!genwarn 12` (hours before empty).')
+
+
+# ---------- server finder ----------
+
+LAST_LIST = {'at': 0, 'servers': []}
+REGIONS = {'na', 'eu', 'oc', 'asia', 'sa'}
+
+
+def get_list_cached(max_age=90):
+    if time.time() - LAST_LIST['at'] > max_age:
+        LAST_LIST['servers'] = fetch_list()
+        LAST_LIST['at'] = time.time()
+    return LAST_LIST['servers']
+
+
+def find_command(parts):
+    words = [w.lower() for w in parts[1:]]
+    mode = 'low'
+    for m in ('low', 'high', 'empty'):
+        if m in words:
+            mode = m
+            words.remove(m)
+    try:
+        servers = get_list_cached()
+    except Exception as e:
+        send_to_discord(f'Could not load the server list right now ({type(e).__name__}). Try again in a minute.')
+        return
+    hits = []
+    for s in servers:
+        name = str(s.get('Name', ''))
+        low = name.lower()
+        if s.get('HasPassword') or not name:
+            continue
+        ok = True
+        for w in words:
+            if w in REGIONS or w == 'as':
+                ok = low.startswith(('asia' if w == 'as' else w) + '-')
+            elif w in ('small', 'smalltribes'):
+                ok = 'smalltribes' in low
+            elif w in ('pve', 'pvp'):
+                ok = f'-{w}-' in low
+            else:
+                ok = w in low.replace('-', '') or w in str(s.get('MapName', '')).lower()
+            if not ok:
+                break
+        if ok:
+            hits.append(s)
+    if mode == 'empty':
+        hits = [s for s in hits if int(s.get('NumPlayers', 0)) == 0]
+    hits.sort(key=lambda s: int(s.get('NumPlayers', 0)), reverse=(mode == 'high'))
+    if not hits:
+        send_to_discord(f'No official servers match `{" ".join(parts[1:]) or "(nothing)"}`.')
+        return
+    shown = hits[:15]
+    rows = [f'{int(s.get("NumPlayers", 0)):>2}/{s.get("MaxPlayers", "?"):<3} {s.get("Name")}' for s in shown]
+    title = {'low': 'Lowest pop', 'high': 'Highest pop', 'empty': 'Empty right now'}[mode]
+    send_to_discord(f'🔎 **{title}**: {" ".join(words) or "all officials"} ({len(hits)} match, showing {len(shown)})\n'
+                    '```\n' + '\n'.join(rows) + '\n```Track one with `!add <number>`.')
+
+
 def format_info(st):
     i = st.get('info')
     if not i:
@@ -559,6 +733,7 @@ next_server_check = 0
 while time.time() < end_at:
     if channel_id and check_commands(state, channel_id):
         next_server_check = 0  # new server added: check it right away
+    check_gens(state)
     if time.time() >= next_server_check:
         check_servers(state)
         next_server_check = time.time() + SERVER_POLL_SECONDS
