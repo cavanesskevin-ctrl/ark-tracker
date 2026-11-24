@@ -8,6 +8,7 @@ TZ = ZoneInfo(os.environ.get('TRACKER_TZ', 'America/Chicago'))
 # Secrets (set in GitHub, never in this file)
 WEBHOOK_URL = os.environ.get('DISCORD_WEBHOOK', '').strip()
 BOT_TOKEN = os.environ.get('DISCORD_BOT_TOKEN', '').strip()
+BOT_NAME = os.environ.get('BOT_NAME', 'ARK Tracker')  # name shown on every message
 
 # Starting list -- only used the very first time; after that !add / !remove in Discord control it
 DEFAULT_SERVERS = ['9652', '9349', '9086']
@@ -39,7 +40,8 @@ def send_to_discord(msg, ping=False):
         return
     try:
         # only generator alerts may ping roles; everything else never pings anyone
-        body = {'content': msg[:2000], 'allowed_mentions': {'parse': ['roles'] if ping else []}}
+        body = {'content': msg[:2000], 'username': BOT_NAME,
+                'allowed_mentions': {'parse': ['roles'] if ping else []}}
         http_json(WEBHOOK_URL, 'POST', body, headers={'User-Agent': DISCORD_UA}, timeout=10)
     except Exception as e:
         print(f'[webhook] error: {e}')
@@ -199,6 +201,12 @@ def record_sample(state, num, name, cur):
         slot[1] += 1
     elif cur <= LOW_MAX:
         slot[2 + cur] += 1
+
+
+def record_change(state, num, delta):
+    s = state.get('daily', {}).get('servers', {}).get(num)
+    if s:
+        s['joins' if delta > 0 else 'leaves'] += abs(delta)
 
 
 def periods_today(state, num, count, daily=None, live=True):
@@ -730,14 +738,30 @@ print(f'ARK tracker running... watching {", ".join(state["servers"]) or "nothing
 
 end_at = time.time() + RUN_SECONDS
 next_server_check = 0
+import traceback
+reported_errors = set()
+
 while time.time() < end_at:
-    if channel_id and check_commands(state, channel_id):
-        next_server_check = 0  # new server added: check it right away
-    check_gens(state)
-    if time.time() >= next_server_check:
-        check_servers(state)
-        next_server_check = time.time() + SERVER_POLL_SECONDS
-    save_state(state)
+    # a bug in one part must never stop the whole tracker: log it, tell Discord once, keep going
+    for step in ('commands', 'gens', 'servers'):
+        try:
+            if step == 'commands' and channel_id and check_commands(state, channel_id):
+                next_server_check = 0  # new server added: check it right away
+            elif step == 'gens':
+                check_gens(state)
+            elif step == 'servers' and time.time() >= next_server_check:
+                next_server_check = time.time() + SERVER_POLL_SECONDS
+                check_servers(state)
+        except Exception as e:
+            traceback.print_exc()
+            key = f'{step}:{type(e).__name__}:{e}'
+            if key not in reported_errors:
+                reported_errors.add(key)
+                send_to_discord(f'🐞 Tracker hit an error in **{step}** (still running): `{type(e).__name__}: {e}`'[:1900])
+    try:
+        save_state(state)
+    except Exception:
+        traceback.print_exc()
     time.sleep(COMMAND_POLL_SECONDS if channel_id else SERVER_POLL_SECONDS)
 
 print('Run finished, next run takes over.')
