@@ -1,2 +1,4 @@
 .webhook
 __pycache__/
+
+salt.json

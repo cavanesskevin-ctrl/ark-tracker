@@ -31,6 +31,7 @@ jobs:
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          SALT_DATA: ${{ secrets.SALT_DATA }}
           RUN_SECONDS: ${{ inputs.run_seconds || '19800' }}
         run: python -u tracker.py
 

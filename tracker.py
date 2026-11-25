@@ -126,7 +126,9 @@ HELP = ('**ARK tracker commands**\n'
         '`!find low island na` lowest-pop official servers matching your words (`high`, `empty`, map, region, pvp/pve, small)\n'
         '`!addgen base1 500` track a TEK generator (add a 3rd number for hours per element, default 18)\n'
         '`!gen base1 500` update after refilling · `!gens` list all · `!removegen base1`\n'
-        '`!genrole @Role` who to ping when low · `!genwarn 12` warn this many hours before empty')
+        '`!genrole @Role` who to ping when low · `!genwarn 12` warn this many hours before empty\n'
+        '`!salt 1234` Salt check rating, what people said + live pop · `!salt quiet na island` filter · '
+        '`!salt vanguard` search notes · `!saltboard` live board of every server (`!saltboard off` to stop)')
 
 LOW_MAX = 3              # stretches are tracked for player counts 0..LOW_MAX
 HISTORY_DAYS = 14        # how many days of hourly data to keep
@@ -369,7 +371,8 @@ def handle_command(state, text):
             send_to_discord(f'Already tracking **{servers[arg]["name"]}**.')
         else:
             servers[arg] = new_entry(arg)
-            send_to_discord(f'✅ Added **{arg}**. Player count shows up within a minute.')
+            send_to_discord(f'✅ Added **{arg}**. Player count shows up within a minute.'
+                            + (f'\nSalt check: {salt_short(arg)}' if arg in SALT_SERVERS else ''))
         return True
     if cmd in ('!remove', '!del', '!delete'):
         if arg in servers:
@@ -395,7 +398,7 @@ def handle_command(state, text):
         if arg and arg not in servers:
             send_to_discord(f'Not tracking `{arg}`. Use `!list` to see what is tracked.')
         else:
-            send_to_discord('\n'.join(format_info(servers[n]) for n in nums) or 'Not tracking any servers.')
+            send_to_discord('\n'.join(format_info(servers[n], n) for n in nums) or 'Not tracking any servers.')
         return True
     if cmd in ('!today', '!summary', '!stats'):
         send_to_discord(format_summary(state.get('daily'), '📊 **Today so far**', state, live=True))
@@ -436,6 +439,12 @@ def handle_command(state, text):
         return True
     if cmd == '!find':
         find_command(parts)
+        return True
+    if cmd == '!salt':
+        salt_command(state, parts)
+        return True
+    if cmd == '!saltboard':
+        saltboard_command(state, parts)
         return True
     if cmd == '!help':
         send_to_discord(HELP)
@@ -713,20 +722,224 @@ def find_command(parts):
         send_to_discord(f'No official servers match `{" ".join(parts[1:]) or "(nothing)"}`.')
         return
     shown = hits[:15]
-    rows = [f'{int(s.get("NumPlayers", 0)):>2}/{s.get("MaxPlayers", "?"):<3} {s.get("Name")}' for s in shown]
+    def salt_icon(s):
+        m = re.search(r'(\d+)$', str(s.get('Name', '')).strip())
+        return SALT_ICON[SALT_SERVERS[m.group(1)][4]] + ' ' if m and m.group(1) in SALT_SERVERS else ''
+    rows = [f'{salt_icon(s)}{int(s.get("NumPlayers", 0)):>2}/{s.get("MaxPlayers", "?"):<3} {s.get("Name")}'
+            for s in shown]
     title = {'low': 'Lowest pop', 'high': 'Highest pop', 'empty': 'Empty right now'}[mode]
     send_to_discord(f'🔎 **{title}**: {" ".join(words) or "all officials"} ({len(hits)} match, showing {len(shown)})\n'
                     '```\n' + '\n'.join(rows) + '\n```Track one with `!add <number>`.')
 
 
-def format_info(st):
+def format_info(st, num=None):
     i = st.get('info')
     if not i:
         return f'**{st["name"]}**: no info yet (server not seen since tracking started)'
     return (f'**{st["name"]}** ({i["map"]})\n'
             f'  Players: {st["last"] if st["last"] is not None else "?"} · Day {i["day"] if i["day"] is not None else "?"} '
             f'· v{i["version"]}{" · ⚠️ offline" if st.get("down") else ""}\n'
-            f'  Uploads: {uploads_text(i["uploads"])}')
+            f'  Uploads: {uploads_text(i["uploads"])}'
+            + (f'\n  Salt check: {salt_short(num)}' if num in SALT_SERVERS else ''))
+
+
+# ---------- Salt check (one-time Discord check, stored in a GitHub secret, never in this public repo) ----------
+
+def load_salt():
+    raw = os.environ.get('SALT_DATA', '').strip()
+    if not raw and os.path.exists('salt.json'):  # local testing only; salt.json is gitignored
+        with open('salt.json', encoding='utf-8') as f:
+            raw = f.read()
+    try:
+        return json.loads(raw) if raw else {}
+    except Exception as e:
+        print(f'[salt] could not read salt data: {type(e).__name__}')
+        return {}
+
+
+SALT = load_salt()
+SALT_SERVERS = SALT.get('s', {})   # num -> [region, map code, hits, last talked, verdict, note]
+SALT_ORDER = 'NQTAH'
+SALT_ICON = {'N': '🟢', 'Q': '🟡', 'T': '🟠', 'A': '🟣', 'H': '🔴'}
+SALT_LABEL = {'N': 'No talk', 'Q': 'Barely mentioned', 'T': 'Talked about', 'A': 'Alliance / owned', 'H': 'Active fighting'}
+SALT_MAPS = {'I': 'The Island', 'C': 'The Center', 'Ab': 'Aberration', 'Ex': 'Extinction',
+             'As': 'Astraeos', 'V': 'Valguero', 'G': 'Genesis'}
+SALT_VERDICT_WORDS = {'none': 'N', 'notalk': 'N', 'clean': 'N', 'barely': 'Q', 'quiet': 'NQ', 'talked': 'T',
+                      'owned': 'A', 'alliance': 'A', 'fighting': 'H', 'fight': 'H', 'hot': 'H'}
+SALT_REGION_WORDS = {'na': 'NA', 'eu': 'EU', 'oc': 'OC', 'asia': 'Asia'}
+SALT_MAP_WORDS = {'island': 'I', 'center': 'C', 'centre': 'C', 'aberration': 'Ab', 'aber': 'Ab', 'ab': 'Ab',
+                  'extinction': 'Ex', 'ext': 'Ex', 'astraeos': 'As', 'astra': 'As', 'valguero': 'V', 'val': 'V',
+                  'genesis': 'G', 'gen': 'G'}
+BOARD_SECONDS = 300   # how often the live Salt board messages are refreshed
+LEGEND = ' · '.join(f'{SALT_ICON[v]} {SALT_LABEL[v]}' for v in SALT_ORDER)
+
+
+def salt_checked():
+    d = SALT.get('checked', '')
+    return datetime.strptime(d, '%Y-%m-%d').strftime('%b %d').replace(' 0', ' ') if d else '?'
+
+
+def short_date(d):
+    return datetime.strptime(d, '%Y-%m-%d').strftime('%b %d %Y').replace(' 0', ' ') if d else 'never'
+
+
+def salt_short(num):
+    r, m, c, d, v, note = SALT_SERVERS[num]
+    return f'{SALT_ICON[v]} {SALT_LABEL[v]} ({c} mentions, last {short_date(d)}). {note}'
+
+
+def live_index():
+    """Server number -> live server entry from the latest official list."""
+    idx = {}
+    for s in LAST_LIST.get('servers') or []:
+        m = re.search(r'(\d+)$', str(s.get('Name', '')).strip())
+        if m:
+            idx[m.group(1)] = s
+    return idx
+
+
+def pop_text(s):
+    return f'{int(s.get("NumPlayers", 0))}/{s.get("MaxPlayers", "?")}' if s else 'offline'
+
+
+def salt_detail(num, live):
+    r, m, c, d, v, note = SALT_SERVERS[num]
+    s = live.get(num)
+    lines = [f'{SALT_ICON[v]} **{num}** · {r} {SALT_MAPS[m]} · **{SALT_LABEL[v]}**',
+             f'  Online now: **{pop_text(s)}**'
+             + (f' · Day {server_info(s)["day"]} · Uploads: {uploads_text(server_info(s)["uploads"])}' if s else ''),
+             f'  Salt talk: {c} mentions, last {short_date(d)}',
+             f'  {note}']
+    return '\n'.join(lines)
+
+
+def salt_command(state, parts):
+    if not SALT_SERVERS:
+        send_to_discord('No Salt check data loaded (the SALT_DATA secret is missing).')
+        return
+    args = [a.lower() for a in parts[1:]]
+    try:
+        get_list_cached()
+    except Exception:
+        pass
+    live = live_index()
+    if not args:
+        counts = ' · '.join(f'{SALT_ICON[v]} {sum(1 for x in SALT_SERVERS.values() if x[4] == v)}' for v in SALT_ORDER)
+        send_to_discord(f'🧂 **Salt check** (one-time, {salt_checked()}): {len(SALT_SERVERS)} Small Tribes PvP servers\n'
+                        f'{LEGEND}\nCounts: {counts}\n'
+                        '`!salt 9144` details + live pop · `!salt quiet na island` filter by rating/region/map '
+                        '(none, barely, quiet, talked, owned, fighting) · `!salt vanguard` search the notes · '
+                        '`!saltboard` live board of every server')
+        return
+    nums = [a for a in args if a.isdigit()]
+    if nums:
+        out = [salt_detail(n, live) if n in SALT_SERVERS else f'**{n}**: not in the Salt check '
+               '(only Small Tribes crossplay PvP; Lost Colony/SE/Rag left out).' for n in nums[:5]]
+        send_to_discord('\n'.join(out))
+        return
+    verdicts, regions, maps, words = set(), set(), set(), []
+    for a in args:
+        if a in SALT_VERDICT_WORDS:
+            verdicts.update(SALT_VERDICT_WORDS[a])
+        elif a in SALT_REGION_WORDS:
+            regions.add(SALT_REGION_WORDS[a])
+        elif a in SALT_MAP_WORDS:
+            maps.add(SALT_MAP_WORDS[a])
+        else:
+            words.append(a)
+    hits = [(n, x) for n, x in SALT_SERVERS.items()
+            if (not verdicts or x[4] in verdicts) and (not regions or x[0] in regions)
+            and (not maps or x[1] in maps) and all(w in x[5].lower() for w in words)]
+    if not hits:
+        send_to_discord(f'No servers in the Salt check match `{" ".join(parts[1:])}`.')
+        return
+    hits.sort(key=lambda h: (SALT_ORDER.index(h[1][4]), int(live[h[0]].get('NumPlayers', 0)) if h[0] in live else 999,
+                             h[0]))
+    shown = hits[:15]
+    rows = [f'{SALT_ICON[x[4]]} **{n}** {x[0]} {SALT_MAPS[x[1]]} · {pop_text(live.get(n))} · '
+            f'{x[5][:70] + ("…" if len(x[5]) > 70 else "")}' for n, x in shown]
+    more = f'\n+{len(hits) - len(shown)} more, add words to narrow it down.' if len(hits) > len(shown) else ''
+    send_to_discord(f'🧂 **Salt check**: `{" ".join(parts[1:])}` ({len(hits)} match, quietest talk + lowest pop first)\n'
+                    + '\n'.join(rows) + more)
+
+
+# ----- live board: one webhook message per map, edited every few minutes -----
+
+def webhook_post(content):
+    """Post and return the new message id (None on failure)."""
+    try:
+        r = http_json(WEBHOOK_URL + '?wait=true', 'POST',
+                      {'content': content[:2000], 'username': BOT_NAME, 'allowed_mentions': {'parse': []}},
+                      headers={'User-Agent': DISCORD_UA}, timeout=10)
+        return r['id']
+    except Exception as e:
+        print(f'[board] post error: {e}')
+        return None
+
+
+def webhook_edit(msg_id, content):
+    """Returns False if the message is gone."""
+    try:
+        http_json(f'{WEBHOOK_URL}/messages/{msg_id}', 'PATCH', {'content': content[:2000]},
+                  headers={'User-Agent': DISCORD_UA}, timeout=10)
+    except urllib.error.HTTPError as e:
+        print(f'[board] edit HTTP {e.code}')
+        return e.code != 404
+    except Exception as e:
+        print(f'[board] edit error: {e}')
+    return True
+
+
+def board_pages(state):
+    live = live_index()
+    stamp = fmt_t(now_tz())
+    tracked = set(state['servers'])
+    pages = [f'🧂 **Salt board**: every Small Tribes PvP server, live pop (updated {stamp} CT, every 5 min)\n'
+             f'{LEGEND}\nRatings are from the one-time Salt check ({salt_checked()}). ★ = tracked. '
+             '`!salt 1234` for what people said.']
+    for code, map_name in SALT_MAPS.items():
+        rows = []
+        for n in sorted((n for n, x in SALT_SERVERS.items() if x[1] == code), key=int):
+            x = SALT_SERVERS[n]
+            rows.append(f'{SALT_ICON[x[4]]} {n} {x[0]:<4} {pop_text(live.get(n)):>7}{" ★" if n in tracked else ""}')
+        pages.append(f'**{map_name}** ({len(rows)})\n```\n' + '\n'.join(rows) + '\n```')
+    return pages
+
+
+def update_board(state):
+    ids = state.get('board')
+    if not ids or not SALT_SERVERS or not LAST_LIST.get('servers'):
+        return
+    for msg_id, page in zip(ids, board_pages(state)):
+        if not webhook_edit(msg_id, page):
+            state.pop('board', None)
+            send_to_discord('Salt board message was deleted, so the board is off. `!saltboard` to post it again.')
+            return
+        time.sleep(0.6)
+
+
+def saltboard_command(state, parts):
+    if not SALT_SERVERS:
+        send_to_discord('No Salt check data loaded (the SALT_DATA secret is missing).')
+        return
+    if len(parts) > 1 and parts[1].lower() in ('off', 'stop'):
+        state.pop('board', None)
+        send_to_discord('Salt board stopped updating. You can delete those messages.')
+        return
+    try:
+        get_list_cached()
+    except Exception:
+        pass
+    ids = []
+    for page in board_pages(state):
+        mid = webhook_post(page)
+        if not mid:
+            send_to_discord('Could not post the Salt board. Try again in a minute.')
+            return
+        ids.append(mid)
+        time.sleep(0.6)
+    state['board'] = ids
+    print('[board] posted')
 
 
 # ---------- main loop ----------
@@ -738,12 +951,13 @@ print(f'ARK tracker running... watching {", ".join(state["servers"]) or "nothing
 
 end_at = time.time() + RUN_SECONDS
 next_server_check = 0
+next_board = 0
 import traceback
 reported_errors = set()
 
 while time.time() < end_at:
     # a bug in one part must never stop the whole tracker: log it, tell Discord once, keep going
-    for step in ('commands', 'gens', 'servers'):
+    for step in ('commands', 'gens', 'servers', 'board'):
         try:
             if step == 'commands' and channel_id and check_commands(state, channel_id):
                 next_server_check = 0  # new server added: check it right away
@@ -752,6 +966,9 @@ while time.time() < end_at:
             elif step == 'servers' and time.time() >= next_server_check:
                 next_server_check = time.time() + SERVER_POLL_SECONDS
                 check_servers(state)
+            elif step == 'board' and time.time() >= next_board:
+                next_board = time.time() + BOARD_SECONDS
+                update_board(state)
         except Exception as e:
             traceback.print_exc()
             key = f'{step}:{type(e).__name__}:{e}'
