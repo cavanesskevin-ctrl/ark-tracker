@@ -128,7 +128,9 @@ HELP = ('**ARK tracker commands**\n'
         '`!gen base1 500` update after refilling · `!gens` list all · `!removegen base1`\n'
         '`!genrole @Role` who to ping when low · `!genwarn 12` warn this many hours before empty\n'
         '`!salt 1234` Salt check rating, what people said + live pop · `!salt quiet na island` filter · '
-        '`!salt vanguard` search notes · `!saltboard` live board of every server (`!saltboard off` to stop)')
+        '`!salt vanguard` search notes · `!saltboard` live board of every server (`!saltboard off` to stop)\n'
+        '`!servers` every Steam Small Tribes PvP server: live pop + what people said · '
+        '`!servers na island online` filter by region/map/rating, `online` = has players')
 
 LOW_MAX = 3              # stretches are tracked for player counts 0..LOW_MAX
 HISTORY_DAYS = 14        # how many days of hourly data to keep
@@ -445,6 +447,9 @@ def handle_command(state, text):
         return True
     if cmd == '!saltboard':
         saltboard_command(state, parts)
+        return True
+    if cmd in ('!servers', '!all'):
+        servers_command(state, parts)
         return True
     if cmd == '!help':
         send_to_discord(HELP)
@@ -940,6 +945,83 @@ def saltboard_command(state, parts):
         time.sleep(0.6)
     state['board'] = ids
     print('[board] posted')
+
+
+# ----- full printout: every Steam (crossplay) Small Tribes PvP server, live pop + Salt notes -----
+
+LIST_MAPS = {'TheIsland': 'The Island', 'TheCenter': 'The Center', 'Aberration': 'Aberration',
+             'Extinction': 'Extinction', 'Astraeos': 'Astraeos', 'Valguero': 'Valguero', 'GenOne': 'Genesis',
+             'Ragnarok': 'Ragnarok', 'LostColony': 'Lost Colony', 'ScorchedEarth': 'Scorched Earth',
+             'ClubARK': 'Club ARK'}
+LIST_MAP_WORDS = {**{w: SALT_MAPS[c] for w, c in SALT_MAP_WORDS.items()},
+                  'rag': 'Ragnarok', 'ragnarok': 'Ragnarok', 'lc': 'Lost Colony', 'lost': 'Lost Colony',
+                  'colony': 'Lost Colony', 'se': 'Scorched Earth', 'scorched': 'Scorched Earth',
+                  'club': 'Club ARK', 'clubark': 'Club ARK'}
+ST_NAME = re.compile(r'^([A-Za-z]+)-PVP-SmallTribes-([A-Za-z]+?)(\d+)$')  # Consoles… names don't match
+
+
+def servers_command(state, parts):
+    args = [a.lower() for a in parts[1:]]
+    regions, maps, verdicts, online = set(), set(), set(), False
+    for a in args:
+        if a in SALT_REGION_WORDS:
+            regions.add(SALT_REGION_WORDS[a])
+        elif a in LIST_MAP_WORDS:
+            maps.add(LIST_MAP_WORDS[a])
+        elif a in SALT_VERDICT_WORDS:
+            verdicts.update(SALT_VERDICT_WORDS[a])
+        elif a in ('online', 'players', 'active'):
+            online = True
+        else:
+            send_to_discord(f'Don\'t know `{a}`. Use a region (na eu oc asia), a map (island center aber ext '
+                            'astra val gen rag lc se club), a rating (none barely quiet talked owned fighting) '
+                            'or `online`. Example: `!servers na island online`')
+            return
+    try:
+        servers = get_list_cached()
+    except Exception as e:
+        send_to_discord(f'Could not load the server list right now ({type(e).__name__}). Try again in a minute.')
+        return
+    by_map = {}
+    for s in servers:
+        m = ST_NAME.match(str(s.get('Name', '')).strip())
+        if not m:
+            continue
+        region, map_name, num = m.group(1), LIST_MAPS.get(m.group(2), m.group(2)), m.group(3)
+        x = SALT_SERVERS.get(num)
+        players = int(s.get('NumPlayers', 0))
+        if ((regions and region not in regions) or (maps and map_name not in maps)
+                or (verdicts and (not x or x[4] not in verdicts)) or (online and players == 0)):
+            continue
+        by_map.setdefault(map_name, []).append((int(num), region, players, s.get('MaxPlayers', '?'), x))
+    if not by_map:
+        send_to_discord(f'No Steam Small Tribes PvP servers match `{" ".join(parts[1:])}`.')
+        return
+    total = sum(len(v) for v in by_map.values())
+    pop = sum(r[2] for v in by_map.values() for r in v)
+    lines = [f'📋 **Small Tribes PvP (Steam)**: {" ".join(parts[1:]) or "every server"} · {total} servers · '
+             f'{pop} players online · {fmt_t(now_tz())} CT\n{LEGEND} · ⚪ Not in the Salt check']
+    order = list(LIST_MAPS.values())
+    for map_name in sorted(by_map, key=lambda k: order.index(k) if k in order else 99):
+        rows = sorted(by_map[map_name])
+        lines.append(f'\n**{map_name}** ({len(rows)} servers, {sum(r[2] for r in rows)} online)')
+        for num, region, players, mx, x in rows:
+            icon = SALT_ICON[x[4]] if x else '⚪'
+            lines.append(f'{icon} **{num}** {region} · {players}/{mx}' + (f' · {x[5]}' if x else ''))
+    # pack lines into Discord-sized messages
+    msgs, cur = [], ''
+    for line in lines:
+        if len(cur) + len(line) + 1 > 1900:
+            msgs.append(cur)
+            cur = line.lstrip('\n')
+        else:
+            cur = f'{cur}\n{line}' if cur else line
+    msgs.append(cur)
+    for i, msg in enumerate(msgs):
+        send_to_discord(msg)
+        if i < len(msgs) - 1:
+            time.sleep(0.6)
+    print(f'[servers] posted {total} servers in {len(msgs)} messages')
 
 
 # ---------- main loop ----------
