@@ -764,24 +764,33 @@ def load_salt():
 
 SALT = load_salt()
 SALT_SERVERS = SALT.get('s', {})   # num -> [region, map code, hits, last talked, verdict, note]
+# a few numbers exist on two maps (9181 Island + 9181 Scorched Earth): the second one is keyed 'num:mapcode'
 SALT_ORDER = 'NQTAH'
 SALT_ICON = {'N': '🟢', 'Q': '🟡', 'T': '🟠', 'A': '🟣', 'H': '🔴'}
 SALT_LABEL = {'N': 'No talk', 'Q': 'Barely mentioned', 'T': 'Talked about', 'A': 'Alliance / owned', 'H': 'Active fighting'}
 SALT_MAPS = {'I': 'The Island', 'C': 'The Center', 'Ab': 'Aberration', 'Ex': 'Extinction',
-             'As': 'Astraeos', 'V': 'Valguero', 'G': 'Genesis'}
+             'As': 'Astraeos', 'V': 'Valguero', 'G': 'Genesis', 'R': 'Ragnarok', 'LC': 'Lost Colony',
+             'SE': 'Scorched Earth'}
 SALT_VERDICT_WORDS = {'none': 'N', 'notalk': 'N', 'clean': 'N', 'barely': 'Q', 'quiet': 'NQ', 'talked': 'T',
                       'owned': 'A', 'alliance': 'A', 'fighting': 'H', 'fight': 'H', 'hot': 'H'}
 SALT_REGION_WORDS = {'na': 'NA', 'eu': 'EU', 'oc': 'OC', 'asia': 'Asia'}
 SALT_MAP_WORDS = {'island': 'I', 'center': 'C', 'centre': 'C', 'aberration': 'Ab', 'aber': 'Ab', 'ab': 'Ab',
                   'extinction': 'Ex', 'ext': 'Ex', 'astraeos': 'As', 'astra': 'As', 'valguero': 'V', 'val': 'V',
-                  'genesis': 'G', 'gen': 'G'}
+                  'genesis': 'G', 'gen': 'G', 'rag': 'R', 'ragnarok': 'R', 'lc': 'LC', 'lost': 'LC',
+                  'colony': 'LC', 'se': 'SE', 'scorched': 'SE'}
 BOARD_SECONDS = 300   # how often the live Salt board messages are refreshed
 LEGEND = ' · '.join(f'{SALT_ICON[v]} {SALT_LABEL[v]}' for v in SALT_ORDER)
 
 
 def salt_checked():
-    d = SALT.get('checked', '')
-    return datetime.strptime(d, '%Y-%m-%d').strftime('%b %d').replace(' 0', ' ') if d else '?'
+    def fmt(d):
+        return datetime.strptime(d, '%Y-%m-%d').strftime('%b %d').replace(' 0', ' ')
+    d, d2 = SALT.get('checked', ''), SALT.get('checked2', '')
+    return (fmt(d) if d else '?') + (f', Rag/LC/SE {fmt(d2)}' if d2 else '')
+
+
+def base_num(key):
+    return key.split(':')[0]
 
 
 def short_date(d):
@@ -809,8 +818,8 @@ def pop_text(s):
 
 def salt_detail(num, live):
     r, m, c, d, v, note = SALT_SERVERS[num]
-    s = live.get(num)
-    lines = [f'{SALT_ICON[v]} **{num}** · {r} {SALT_MAPS[m]} · **{SALT_LABEL[v]}**',
+    s = live.get(base_num(num))
+    lines = [f'{SALT_ICON[v]} **{base_num(num)}** · {r} {SALT_MAPS[m]} · **{SALT_LABEL[v]}**',
              f'  Online now: **{pop_text(s)}**'
              + (f' · Day {server_info(s)["day"]} · Uploads: {uploads_text(server_info(s)["uploads"])}' if s else ''),
              f'  Salt talk: {c} mentions, last {short_date(d)}',
@@ -838,8 +847,11 @@ def salt_command(state, parts):
         return
     nums = [a for a in args if a.isdigit()]
     if nums:
-        out = [salt_detail(n, live) if n in SALT_SERVERS else f'**{n}**: not in the Salt check '
-               '(only Small Tribes crossplay PvP; Lost Colony/SE/Rag left out).' for n in nums[:5]]
+        out = []
+        for n in nums[:5]:
+            keys = [k for k in SALT_SERVERS if base_num(k) == n]
+            out += [salt_detail(k, live) for k in keys] or [
+                f'**{n}**: not in the Salt check (only Small Tribes crossplay PvP; Club ARK left out).']
         send_to_discord('\n'.join(out))
         return
     verdicts, regions, maps, words = set(), set(), set(), []
@@ -858,6 +870,7 @@ def salt_command(state, parts):
     if not hits:
         send_to_discord(f'No servers in the Salt check match `{" ".join(parts[1:])}`.')
         return
+    hits = [(base_num(n), x) for n, x in hits]
     hits.sort(key=lambda h: (SALT_ORDER.index(h[1][4]), int(live[h[0]].get('NumPlayers', 0)) if h[0] in live else 999,
                              h[0]))
     shown = hits[:15]
@@ -904,8 +917,8 @@ def board_pages(state):
              '`!salt 1234` for what people said.']
     for code, map_name in SALT_MAPS.items():
         rows = []
-        for n in sorted((n for n, x in SALT_SERVERS.items() if x[1] == code), key=int):
-            x = SALT_SERVERS[n]
+        for k in sorted((k for k, x in SALT_SERVERS.items() if x[1] == code), key=lambda k: int(base_num(k))):
+            x, n = SALT_SERVERS[k], base_num(k)
             rows.append(f'{SALT_ICON[x[4]]} {n} {x[0]:<4} {pop_text(live.get(n)):>7}{" ★" if n in tracked else ""}')
         pages.append(f'**{map_name}** ({len(rows)})\n```\n' + '\n'.join(rows) + '\n```')
     return pages
@@ -954,9 +967,8 @@ LIST_MAPS = {'TheIsland': 'The Island', 'TheCenter': 'The Center', 'Aberration':
              'Ragnarok': 'Ragnarok', 'LostColony': 'Lost Colony', 'ScorchedEarth': 'Scorched Earth',
              'ClubARK': 'Club ARK'}
 LIST_MAP_WORDS = {**{w: SALT_MAPS[c] for w, c in SALT_MAP_WORDS.items()},
-                  'rag': 'Ragnarok', 'ragnarok': 'Ragnarok', 'lc': 'Lost Colony', 'lost': 'Lost Colony',
-                  'colony': 'Lost Colony', 'se': 'Scorched Earth', 'scorched': 'Scorched Earth',
                   'club': 'Club ARK', 'clubark': 'Club ARK'}
+MAP_CODES = {name: code for code, name in SALT_MAPS.items()}
 ST_NAME = re.compile(r'^([A-Za-z]+)-PVP-SmallTribes-([A-Za-z]+?)(\d+)$')  # Consoles… names don't match
 
 
@@ -988,7 +1000,9 @@ def servers_command(state, parts):
         if not m:
             continue
         region, map_name, num = m.group(1), LIST_MAPS.get(m.group(2), m.group(2)), m.group(3)
-        x = SALT_SERVERS.get(num)
+        x = SALT_SERVERS.get(f'{num}:{MAP_CODES.get(map_name)}') or SALT_SERVERS.get(num)
+        if x and SALT_MAPS.get(x[1]) != map_name:  # same number, other map's notes
+            x = None
         players = int(s.get('NumPlayers', 0))
         if ((regions and region not in regions) or (maps and map_name not in maps)
                 or (verdicts and (not x or x[4] not in verdicts)) or (online and players == 0)):
